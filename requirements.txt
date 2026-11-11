@@ -1,0 +1,6 @@
+tensorflow>=2.15.0
+gradio>=4.0.0
+matplotlib>=3.7.0
+scikit-learn>=1.2.0
+pillow>=9.0.0
+numpy>=1.23.5
