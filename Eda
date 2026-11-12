@@ -1,0 +1,510 @@
+
+from pathlib import Path
+from zipfile import ZipFile, BadZipFile
+from io import BytesIO
+import os
+import re
+import pandas as pd
+
+
+# DATASET LOCATION
+
+
+DATASET_PATH = Path(
+    r"C:\Users\njrad\Downloads\ORIGINA UNCLEANED DATASETS\DATASETS"
+)
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
+    ".webp", ".gif", ".dcm", ".dicom", ".jfif",
+    ".jp2", ".j2k", ".ppm", ".pgm", ".pbm",
+    ".npy", ".npz"
+}
+
+GENERIC_FOLDERS = {
+    "images", "image", "img", "imgs", "data", "dataset",
+    "datasets", "train", "training", "test", "testing",
+    "valid", "validation", "val", "scans", "scan",
+    "files", "output", "outputs"
+}
+
+records = []
+warnings = []
+
+
+
+# LABELS
+
+def norm(text):
+    """Remove spaces, underscores, hyphens and punctuation."""
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def is_stroke_label(label):
+    """Recognise Stroke and the misspelling Sroke."""
+    return (
+        "stroke" in label or "sroke" in label
+    ) and not (
+        "nostroke" in label
+        or "nonstroke" in label
+        or "nosroke" in label
+    )
+
+
+def category_and_subtype(path_parts):
+    """
+    Classify images using folder and archive labels.
+    Preserve identifiable tumor and stroke subtypes.
+    """
+
+    parts = [str(p) for p in path_parts]
+    labels = [(p, norm(p)) for p in parts]
+
+    tumor_positive = []
+    stroke_positive = []
+    normal_found = False
+    negative_found = False
+
+    for original, label in labels:
+
+        # Negative labels: check these before positive labels.
+        no_tumor = any(x in label for x in (
+            "notumor", "notumour",
+            "nontumor", "nontumour"
+        ))
+
+        no_stroke = any(x in label for x in (
+            "nostroke", "nonstroke", "nosroke"
+        ))
+
+        if no_tumor or no_stroke:
+            negative_found = True
+            continue
+
+        if label in {"normal", "healthy", "control"}:
+            normal_found = True
+
+        # Tumor labels and common tumor subtypes
+        if "tumor" in label or "tumour" in label:
+            tumor_positive.append((original, label))
+
+        elif label in {
+            "glioma", "gliomas",
+            "meningioma", "meningiomas",
+            "pituitary", "pituitaryadenoma"
+        }:
+            tumor_positive.append((original, label))
+
+        # Stroke labels, including Sroke
+        if is_stroke_label(label):
+            stroke_positive.append((original, label))
+
+        elif label in {
+            "ischemic", "ischaemic",
+            "hemorrhagic", "haemorrhagic"
+        }:
+            has_stroke_context = any(
+                is_stroke_label(other_label)
+                for _, other_label in labels
+            )
+
+            if has_stroke_context:
+                stroke_positive.append((original, label))
+
+    #  category
+    last_tumor = tumor_positive[-1] if tumor_positive else None
+    last_stroke = stroke_positive[-1] if stroke_positive else None
+
+    if last_tumor and last_stroke:
+
+        tumor_index = labels.index(last_tumor)
+        stroke_index = labels.index(last_stroke)
+
+        if tumor_index > stroke_index:
+            category = "Tumor"
+            marker = last_tumor
+        else:
+            category = "Stroke"
+            marker = last_stroke
+
+    elif last_tumor:
+        category = "Tumor"
+        marker = last_tumor
+
+    elif last_stroke:
+        category = "Stroke"
+        marker = last_stroke
+
+    elif normal_found or negative_found:
+        category = "Normal"
+        marker = None
+
+    else:
+        return "Unclassified", "Unknown"
+
+    # Normal/negative labels do not have tumor/stroke subtypes.
+    if marker is None:
+        return category, "Normal / negative label"
+
+    marker_index = labels.index(marker)
+    marker_name, marker_label = marker
+    subtype_candidates = []
+
+    
+    if category == "Tumor":
+        if marker_label not in {
+            "tumor", "tumors", "tumour", "tumours"
+        }:
+            subtype_candidates.append(marker_name)
+
+    elif category == "Stroke":
+        if marker_label not in {
+            "stroke", "strokes", "sroke", "srokes"
+        }:
+            subtype_candidates.append(marker_name)
+
+    for original, label in labels[marker_index + 1:]:
+
+        if label in GENERIC_FOLDERS:
+            continue
+
+        if category == "Tumor":
+            if label in {
+                "tumor", "tumors", "tumour", "tumours"
+            }:
+                continue
+
+            subtype_candidates.append(original)
+
+        elif category == "Stroke":
+            if label in {
+                "stroke", "strokes", "sroke", "srokes"
+            }:
+                continue
+
+            subtype_candidates.append(original)
+
+    subtype = (
+        subtype_candidates[-1]
+        if subtype_candidates
+        else f"{category} - subtype unspecified"
+    )
+
+    # Standardise "Sroke."
+    if category == "Stroke" and norm(subtype) in {
+        "sroke", "srokes"
+    }:
+        subtype = "Stroke - subtype unspecified"
+
+    return category, subtype
+
+
+# RECORD IMAGE DETAILS
+
+
+def record_image(contributor, source, label_parts):
+    category, subtype = category_and_subtype(label_parts)
+
+    if norm(contributor) == "root":
+        contributor = "EXTRA"
+
+    records.append({
+        "Contributor": contributor,
+        "Category": category,
+        "Subtype": subtype,
+        "Source": source
+    })
+
+
+# SCAN ZIP ARCHIVES
+
+def scan_zip_bytes(
+    zip_bytes, contributor, source_name, parent_parts, depth=0
+):
+    """
+    Scan ZIP files in memory, including nested ZIP archives.
+    Does not extract archives to disk.
+    """
+
+    if depth > 20:
+        warnings.append({
+            "Source": source_name,
+            "Issue": "Maximum ZIP nesting depth exceeded"
+        })
+        return
+
+    try:
+        with ZipFile(BytesIO(zip_bytes)) as archive:
+
+            for member in archive.infolist():
+
+                if member.is_dir():
+                    continue
+
+                member_parts = list(Path(member.filename).parts)
+
+                if not member_parts:
+                    continue
+
+                filename = member_parts[-1]
+                lower_name = filename.lower()
+
+                # Handle a ZIP file Within a ZIP.
+                if lower_name.endswith(".zip"):
+                    try:
+                        with archive.open(member) as nested_file:
+                            nested_bytes = nested_file.read()
+
+                        scan_zip_bytes(
+                            nested_bytes,
+                            contributor,
+                            f"{source_name}!/{member.filename}",
+                            parent_parts
+                            + member_parts[:-1]
+                            + [Path(filename).stem],
+                            depth + 1
+                        )
+
+                    except Exception as exc:
+                        warnings.append({
+                            "Source": (
+                                f"{source_name}!/{member.filename}"
+                            ),
+                            "Issue": str(exc)
+                        })
+
+                    continue
+
+                is_image = (
+                    Path(filename).suffix.lower()
+                    in IMAGE_EXTENSIONS
+                    or lower_name.endswith(".nii.gz")
+                )
+
+                if is_image:
+                    record_image(
+                        contributor,
+                        f"{source_name}!/{member.filename}",
+                        parent_parts + member_parts[:-1]
+                    )
+
+    except (BadZipFile, OSError, RuntimeError) as exc:
+        warnings.append({
+            "Source": source_name,
+            "Issue": str(exc)
+        })
+
+
+# SCAN CONTRIBUTOR FOLDERS
+
+def scan_contributor_folder(folder, contributor):
+
+    for root, dirs, files in os.walk(folder):
+        root_path = Path(root)
+
+        # Avoid following symbolic-link directories.
+        dirs[:] = [
+            d for d in dirs
+            if not (root_path / d).is_symlink()
+        ]
+
+        for filename in files:
+
+            file_path = root_path / filename
+
+            if filename.startswith("~$"):
+                continue
+
+            relative_parts = list(
+                file_path.relative_to(folder).parts
+            )
+
+            if filename.lower().endswith(".zip"):
+
+                try:
+                    with open(file_path, "rb") as f:
+                        zip_bytes = f.read()
+
+                    scan_zip_bytes(
+                        zip_bytes,
+                        contributor,
+                        str(file_path),
+                        relative_parts[:-1] + [file_path.stem]
+                    )
+
+                except OSError as exc:
+                    warnings.append({
+                        "Source": str(file_path),
+                        "Issue": str(exc)
+                    })
+
+            else:
+
+                lower_name = filename.lower()
+
+                is_image = (
+                    file_path.suffix.lower()
+                    in IMAGE_EXTENSIONS
+                    or lower_name.endswith(".nii.gz")
+                )
+
+                if is_image:
+                    record_image(
+                        contributor,
+                        str(file_path),
+                        relative_parts[:-1]
+                    )
+
+
+# RUN THE INVENTORY
+
+if not DATASET_PATH.is_dir():
+    raise FileNotFoundError(
+        f"Dataset folder not found: {DATASET_PATH}"
+    )
+
+for item in DATASET_PATH.iterdir():
+
+    if item.is_dir():
+        scan_contributor_folder(item, item.name)
+
+    elif item.is_file() and item.suffix.lower() == ".zip":
+
+        try:
+            with open(item, "rb") as f:
+                scan_zip_bytes(
+                    f.read(),
+                    "EXTRA",
+                    str(item),
+                    [item.stem]
+                )
+
+        except OSError as exc:
+            warnings.append({
+                "Source": str(item),
+                "Issue": str(exc)
+            })
+
+
+# CREATE SUMMARY TABLES
+
+
+details_df = pd.DataFrame(
+    records,
+    columns=["Contributor", "Category", "Subtype", "Source"]
+)
+
+# replace any remaining ROOT labels.
+if not details_df.empty:
+    details_df["Contributor"] = (
+        details_df["Contributor"].replace({
+            "ROOT": "EXTRA",
+            "root": "EXTRA"
+        })
+    )
+
+overall_df = (
+    details_df.groupby("Category")
+    .size()
+    .reindex(
+        ["Tumor", "Normal", "Stroke", "Unclassified"],
+        fill_value=0
+    )
+    .rename("Image Count")
+    .reset_index()
+)
+
+contributor_df = pd.crosstab(
+    details_df["Contributor"],
+    details_df["Category"]
+)
+
+for category in ["Tumor", "Normal", "Stroke", "Unclassified"]:
+    if category not in contributor_df.columns:
+        contributor_df[category] = 0
+
+contributor_df = contributor_df[
+    ["Tumor", "Normal", "Stroke", "Unclassified"]
+]
+
+contributor_df["Total"] = contributor_df.sum(axis=1)
+contributor_df = contributor_df.reset_index()
+
+# Rename ROOT to EXTRA
+contributor_df["Contributor"] = (
+    contributor_df["Contributor"].replace({
+        "ROOT": "EXTRA",
+        "root": "EXTRA"
+    })
+)
+
+subtype_df = (
+    details_df.groupby(["Category", "Subtype"])
+    .size()
+    .reset_index(name="Image Count")
+)
+
+unclassified_df = details_df[
+    details_df["Category"] == "Unclassified"
+].copy()
+
+warnings_df = pd.DataFrame(
+    warnings,
+    columns=["Source", "Issue"]
+)
+
+
+# RESULTS
+
+print("\n=== OVERALL IMAGE COUNTS ===")
+print(overall_df.to_string(index=False))
+print(f"\nTOTAL IMAGE FILES COUNTED: {len(details_df)}")
+
+print("\n=== CONTRIBUTOR BREAKDOWN ===")
+print(contributor_df.to_string(index=False))
+
+print("\n=== TUMOR AND STROKE SUBTYPES ===")
+print(subtype_df.to_string(index=False))
+
+print("\n=== UNCLASSIFIED FILES ===")
+print(f"Unclassified images: {len(unclassified_df)}")
+
+if not unclassified_df.empty:
+    print(
+        unclassified_df[
+            ["Contributor", "Source"]
+        ].head(50).to_string(index=False)
+    )
+
+print("\n=== FILES OR ARCHIVES WITH ERRORS ===")
+print(f"Warnings: {len(warnings_df)}")
+
+if not warnings_df.empty:
+    print(warnings_df.head(50).to_string(index=False))
+else:
+    print("No file or archive errors were reported.")
+
+
+# SAVE REPORTS
+
+
+reports = {
+    "image_inventory_details.csv": details_df,
+    "image_inventory_overall.csv": overall_df,
+    "image_inventory_contributors.csv": contributor_df,
+    "image_inventory_subtypes.csv": subtype_df,
+    "image_inventory_unclassified.csv": unclassified_df,
+    "image_inventory_warnings.csv": warnings_df
+}
+
+for filename, dataframe in reports.items():
+    dataframe.to_csv(
+        DATASET_PATH / filename,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+print("\nAll inventory reports saved to:")
+print(DATASET_PATH)
+
+print("\nOriginal images and ZIP archives were not renamed or extracted.")
