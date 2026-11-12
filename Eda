@@ -461,7 +461,526 @@ print(overall_df.to_string(index=False))
 print(f"\nTOTAL IMAGE FILES COUNTED: {len(details_df)}")
 
 print("\n=== CONTRIBUTOR BREAKDOWN ===")
-print(contributor_df.to_string(index=False))
+print(contributor_df.to_string(index=False)
+
+
+#!/usr/bin/env python3
+"""
+MRI dataset analysis
+====================
+Expected folder layout (class names are matched case-insensitively and
+can be anywhere under the root, e.g. root/train/Tumour/...):
+
+    dataset_root/
+        Normal/   *.jpg|png|tif|bmp ...
+        Tumour/   (or Tumor/)
+        Stroke/
+
+Checklist covered
+-----------------
+1. Analyse image dimensions/resolutions and file sizes
+2. Display sample MRI grids for Normal, Tumour and Stroke
+3. Create a data-quality summary table
+
+Usage
+-----
+    python mri_dataset_analysis.py /path/to/dataset_root
+    python mri_dataset_analysis.py /path/to/dataset_root --samples 8 --out results
+
+Requires: pip install pillow numpy pandas matplotlib
+"""
+
+import argparse
+import hashlib
+import random
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from PIL import Image, UnidentifiedImageError
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
+
+# canonical class name -> accepted folder-name spellings (lower case)
+CLASS_ALIASES = {
+    "Normal": {"normal", "healthy", "no_tumor", "notumor", "no_tumour"},
+    "Tumour": {"tumour", "tumor", "tumours", "tumors", "brain_tumor", "brain_tumour"},
+    "Stroke": {"stroke", "strokes", "ischemic", "ischaemic"},
+}
+
+
+# --------------------------------------------------------------------------- #
+# Discovery
+# --------------------------------------------------------------------------- #
+def canonical_class(folder_name: str):
+    name = folder_name.strip().lower()
+    for canon, aliases in CLASS_ALIASES.items():
+        if name in aliases:
+            return canon
+    return None
+
+
+def discover_images(root: Path) -> pd.DataFrame:
+    """Walk the root and label each image by the nearest ancestor folder
+    that matches one of the known classes."""
+    rows = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+            continue
+        rel = path.relative_to(root)
+        label = None
+        for parent in rel.parents:
+            label = canonical_class(parent.name)
+            if label:
+                break
+        if label is None:
+            label = canonical_class(path.parent.name) or "Unlabelled"
+        # source = first folder under root that is not itself a class folder
+        # (e.g. root/kaggle_set_A/Tumour/img.jpg -> "kaggle_set_A")
+        parts = rel.parts
+        if len(parts) >= 3 and canonical_class(parts[0]) is None:
+            source = parts[0]
+        else:
+            source = root.resolve().name
+        rows.append({"path": path, "class": label, "source": source})
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Per-image analysis
+# --------------------------------------------------------------------------- #
+def analyse_image(path: Path) -> dict:
+    info = {
+        "file_name": path.name,
+        "file_size_kb": path.stat().st_size / 1024,
+        "extension": path.suffix.lower().lstrip("."),
+        "img_format": None,
+        "readable": True,
+        "width": np.nan,
+        "height": np.nan,
+        "megapixels": np.nan,
+        "aspect_ratio": np.nan,
+        "mode": None,
+        "dpi_x": np.nan,
+        "mean_intensity": np.nan,
+        "std_intensity": np.nan,
+        "md5": None,
+    }
+    try:
+        info["md5"] = hashlib.md5(path.read_bytes()).hexdigest()
+        with Image.open(path) as im:
+            im.load()  # forces full decode -> catches truncated files
+            w, h = im.size
+            info.update(
+                width=w,
+                height=h,
+                megapixels=w * h / 1e6,
+                aspect_ratio=w / h if h else np.nan,
+                mode=im.mode,
+                img_format=im.format,
+            )
+            dpi = im.info.get("dpi")
+            if dpi:
+                info["dpi_x"] = float(dpi[0])
+            grey = np.asarray(im.convert("L"), dtype=np.float32)
+            info["mean_intensity"] = float(grey.mean())
+            info["std_intensity"] = float(grey.std())
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+        info["readable"] = False
+    return info
+
+
+def analyse_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    records = []
+    total = len(df)
+    for i, (path, label, source) in enumerate(
+        zip(df["path"], df["class"], df["source"]), 1
+    ):
+        if i % 200 == 0 or i == total:
+            print(f"  analysed {i}/{total} images", end="\r")
+        rec = analyse_image(path)
+        rec["class"] = label
+        rec["source"] = source
+        rec["path"] = path
+        records.append(rec)
+    print()
+    out = pd.DataFrame(records)
+    out["dimensions"] = out.apply(
+        lambda r: f"{int(r.width)}x{int(r.height)}" if r.readable else "unreadable",
+        axis=1,
+    )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 1. Dimensions / resolution / file size analysis
+# --------------------------------------------------------------------------- #
+def dimension_and_size_report(meta: pd.DataFrame, out_dir: Path):
+    ok = meta[meta.readable]
+
+    print("\n" + "=" * 70)
+    print("1. IMAGE DIMENSIONS, RESOLUTION AND FILE SIZE")
+    print("=" * 70)
+
+    summary = (
+        ok.groupby("class")
+        .agg(
+            images=("file_name", "count"),
+            width_min=("width", "min"),
+            width_median=("width", "median"),
+            width_max=("width", "max"),
+            height_min=("height", "min"),
+            height_median=("height", "median"),
+            height_max=("height", "max"),
+            megapixels_mean=("megapixels", "mean"),
+            size_kb_min=("file_size_kb", "min"),
+            size_kb_mean=("file_size_kb", "mean"),
+            size_kb_max=("file_size_kb", "max"),
+            total_mb=("file_size_kb", lambda s: s.sum() / 1024),
+        )
+        .round(2)
+    )
+    print("\nPer-class dimension / size statistics:")
+    print(summary.T.to_string())
+    summary.to_csv(out_dir / "dimension_size_summary.csv")
+
+    print("\nMost common resolutions (overall):")
+    print(ok["dimensions"].value_counts().head(10).to_string())
+
+    res_by_class = pd.crosstab(ok["dimensions"], ok["class"])
+    res_by_class["total"] = res_by_class.sum(axis=1)
+    res_by_class = res_by_class.sort_values("total", ascending=False)
+    res_by_class.to_csv(out_dir / "resolution_counts_by_class.csv")
+    print(f"\nUnique resolutions found: {ok['dimensions'].nunique()}")
+
+    # ---- plots ----
+    classes = sorted(ok["class"].unique())
+    colours = plt.cm.Set2(np.linspace(0, 1, max(len(classes), 3)))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    ax = axes[0, 0]
+    for c, col in zip(classes, colours):
+        sub = ok[ok["class"] == c]
+        ax.scatter(sub.width, sub.height, s=14, alpha=0.5, label=c, color=col)
+    ax.set_title("Width vs height (pixels)")
+    ax.set_xlabel("Width")
+    ax.set_ylabel("Height")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    ax = axes[0, 1]
+    ok.boxplot(column="file_size_kb", by="class", ax=ax)
+    ax.set_title("File size by class")
+    ax.set_xlabel("")
+    ax.set_ylabel("KB")
+    fig.suptitle("")
+
+    ax = axes[1, 0]
+    for c, col in zip(classes, colours):
+        ax.hist(ok[ok["class"] == c].megapixels, bins=30, alpha=0.55, label=c, color=col)
+    ax.set_title("Megapixel distribution")
+    ax.set_xlabel("Megapixels")
+    ax.set_ylabel("Images")
+    ax.legend()
+
+    ax = axes[1, 1]
+    top = ok["dimensions"].value_counts().head(8)
+    ax.barh(top.index[::-1], top.values[::-1], color="#4c72b0")
+    ax.set_title("Top resolutions")
+    ax.set_xlabel("Images")
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "dimensions_and_sizes.png", dpi=150)
+    plt.close(fig)
+    print(f"\nSaved: {out_dir / 'dimensions_and_sizes.png'}")
+
+
+# --------------------------------------------------------------------------- #
+# 2. Sample MRI grids
+# --------------------------------------------------------------------------- #
+def sample_grids(meta: pd.DataFrame, out_dir: Path, n: int, seed: int, show: bool):
+    print("\n" + "=" * 70)
+    print("2. SAMPLE MRI GRIDS")
+    print("=" * 70)
+
+    ok = meta[meta.readable]
+    wanted = [c for c in ("Normal", "Tumour", "Stroke") if c in set(ok["class"])]
+    missing = [c for c in ("Normal", "Tumour", "Stroke") if c not in wanted]
+    if missing:
+        print(f"WARNING: no images found for: {', '.join(missing)}")
+    if not wanted:
+        return
+
+    rng = random.Random(seed)
+    cols = n
+    fig, axes = plt.subplots(
+        len(wanted), cols, figsize=(2.2 * cols, 2.5 * len(wanted)), squeeze=False
+    )
+
+    for r, cls in enumerate(wanted):
+        paths = list(ok[ok["class"] == cls]["path"])
+        picks = rng.sample(paths, min(cols, len(paths)))
+        for c in range(cols):
+            ax = axes[r][c]
+            ax.axis("off")
+            if c < len(picks):
+                with Image.open(picks[c]) as im:
+                    ax.imshow(im.convert("L"), cmap="gray")
+                ax.set_title(f"{picks[c].stem[:14]}", fontsize=7)
+            if c == 0:
+                ax.text(
+                    -0.08, 0.5, f"{cls}\n(n={len(paths)})",
+                    transform=ax.transAxes, rotation=90, va="center", ha="right",
+                    fontsize=12, fontweight="bold",
+                )
+    fig.suptitle("Sample MRI scans by class", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    path = out_dir / "sample_mri_grid.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {path}")
+
+    # one separate grid per class too (handy for reports)
+    for cls in wanted:
+        paths = list(ok[ok["class"] == cls]["path"])
+        picks = rng.sample(paths, min(n * 2, len(paths)))
+        ncols = min(n, len(picks))
+        nrows = int(np.ceil(len(picks) / ncols))
+        f2, ax2 = plt.subplots(nrows, ncols, figsize=(2.2 * ncols, 2.3 * nrows), squeeze=False)
+        for a in ax2.ravel():
+            a.axis("off")
+        for a, p in zip(ax2.ravel(), picks):
+            with Image.open(p) as im:
+                a.imshow(im.convert("L"), cmap="gray")
+        f2.suptitle(f"{cls} samples", fontsize=13, fontweight="bold")
+        f2.tight_layout()
+        f2.savefig(out_dir / f"sample_grid_{cls.lower()}.png", dpi=150)
+        plt.close(f2)
+
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------- #
+# 3. Data-quality summary table
+# --------------------------------------------------------------------------- #
+COLOUR_NAMES = {
+    "L": "Grayscale (1 channel)",
+    "I": "Grayscale 32-bit (1 channel)",
+    "I;16": "Grayscale 16-bit (1 channel)",
+    "1": "Binary (1 channel)",
+    "P": "Palette/indexed (1 channel)",
+    "LA": "Grayscale + alpha (2 channels)",
+    "RGB": "RGB (3 channels)",
+    "RGBA": "RGBA (4 channels)",
+    "CMYK": "CMYK (4 channels)",
+}
+CLASSES = ("Normal", "Tumour", "Stroke")
+
+
+def _pct(n, total):
+    return f"{n} ({n / total * 100:.1f}%)" if total else f"{n}"
+
+
+def data_quality_table(meta: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
+    print("\n" + "=" * 70)
+    print("3. DATA-QUALITY SUMMARY")
+    print("=" * 70)
+
+    meta = meta.copy()
+    ok = meta[meta.readable]
+    n_ok = len(ok)
+
+    # --- per-image flags --------------------------------------------------- #
+    # exact duplicate = identical file bytes; the first copy is not counted
+    meta["is_duplicate"] = meta.duplicated(subset="md5", keep="first") & meta.readable
+    # the same file stored under two different class folders -> at least one
+    # of the labels must be wrong
+    labelled_ok = ok[ok["class"] != "Unlabelled"]
+    conflict_hashes = (
+        labelled_ok.groupby("md5")["class"].nunique().loc[lambda s: s > 1].index
+    )
+    meta["label_conflict"] = meta["md5"].isin(conflict_hashes)
+    meta["unlabelled"] = meta["class"] == "Unlabelled"
+
+    # --- class counts ------------------------------------------------------ #
+    counts = meta["class"].value_counts()
+    class_counts = {c: int(counts.get(c, 0)) for c in CLASSES}
+
+    # --- dimension range --------------------------------------------------- #
+    if n_ok:
+        dim_range = (
+            f"Width {int(ok.width.min())} to {int(ok.width.max())} px, "
+            f"height {int(ok.height.min())} to {int(ok.height.max())} px\n"
+            f"Smallest {ok.loc[ok.megapixels.idxmin(), 'dimensions']}, "
+            f"largest {ok.loc[ok.megapixels.idxmax(), 'dimensions']}\n"
+            f"{ok.dimensions.nunique()} unique resolution(s)"
+        )
+        fmt_counts = ok["img_format"].fillna("Unknown").value_counts()
+        fmt_text = "\n".join(f"{k}: {_pct(v, n_ok)}" for k, v in fmt_counts.items())
+        col_counts = ok["mode"].map(lambda m: COLOUR_NAMES.get(m, m)).value_counts()
+        col_text = "\n".join(f"{k}: {_pct(v, n_ok)}" for k, v in col_counts.items())
+        size_text = (
+            f"{ok.file_size_kb.min():.1f} KB to {ok.file_size_kb.max():.1f} KB "
+            f"(mean {ok.file_size_kb.mean():.1f} KB)"
+        )
+    else:
+        dim_range = fmt_text = col_text = size_text = "n/a (no readable images)"
+
+    # --- class imbalance --------------------------------------------------- #
+    labelled_total = sum(class_counts.values())
+    if labelled_total and min(class_counts.values()) > 0:
+        ratio = max(class_counts.values()) / min(class_counts.values())
+        verdict = "balanced" if ratio <= 1.5 else "IMBALANCED"
+        imbalance = (
+            f"{ratio:.2f}:1 (largest:smallest) - {verdict}\n"
+            + " | ".join(
+                f"{c} {class_counts[c] / labelled_total * 100:.1f}%" for c in CLASSES
+            )
+        )
+    else:
+        imbalance = "undefined - at least one class has 0 images"
+
+    # --- sources and source-class association ------------------------------ #
+    src_counts = meta["source"].value_counts()
+    sources_text = f"{len(src_counts)} source(s)\n" + "\n".join(
+        f"{name}: {n} images" for name, n in src_counts.items()
+    )
+    assoc = pd.crosstab(meta["source"], meta["class"])
+    cols = [c for c in (*CLASSES, "Unlabelled") if c in assoc.columns or c in CLASSES]
+    assoc = assoc.reindex(columns=cols, fill_value=0)
+    assoc_text = "\n".join(
+        f"{src}: " + ", ".join(f"{c} {int(assoc.loc[src, c])}" for c in cols)
+        for src in assoc.index
+    )
+
+    # --- the summary table ------------------------------------------------- #
+    n_dup = int(meta.is_duplicate.sum())
+    n_corrupt = int((~meta.readable).sum())
+    n_missing = int(meta.unlabelled.sum())
+    n_incorrect = int(meta.label_conflict.sum())
+
+    rows = [
+        ("Normal images", str(class_counts["Normal"])),
+        ("Tumour images", str(class_counts["Tumour"])),
+        ("Stroke images", str(class_counts["Stroke"])),
+        ("Dataset sources", sources_text),
+        ("Duplicate images remaining", str(n_dup)),
+        ("Corrupt images remaining", str(n_corrupt)),
+        ("Missing labels remaining", str(n_missing)),
+        (
+            "Incorrect labels remaining",
+            f"{n_incorrect} (same file found under different class folders)",
+        ),
+        ("Image dimension range", dim_range),
+        ("Image format distribution", fmt_text),
+        ("Colour channel distribution", col_text),
+        ("File size range", size_text),
+        ("Class imbalance", imbalance),
+        ("Source-class association", assoc_text),
+    ]
+
+    # console output
+    print()
+    for metric, value in rows:
+        first, *rest = value.split("\n")
+        print(f"{metric:<30}{first}")
+        for line in rest:
+            print(f"{'':<30}{line}")
+
+    print("\nSource x class counts:")
+    print(assoc.to_string())
+
+    # --- save everything --------------------------------------------------- #
+    table = pd.DataFrame(rows, columns=["Metric", "Value"])
+    table.to_csv(out_dir / "data_quality_summary.csv", index=False)
+    assoc.to_csv(out_dir / "source_class_association.csv")
+    meta.drop(columns=["path"]).to_csv(out_dir / "image_level_metadata.csv", index=False)
+
+    flagged = meta[
+        (~meta.readable) | meta.is_duplicate | meta.label_conflict | meta.unlabelled
+    ]
+    if len(flagged):
+        flagged[["path", "class", "source", "readable", "is_duplicate",
+                 "label_conflict", "unlabelled"]].to_csv(
+            out_dir / "flagged_images.csv", index=False
+        )
+        print(f"\n{len(flagged)} flagged images written to flagged_images.csv")
+
+    # --- render the table as a PNG ----------------------------------------- #
+    line_counts = [v.count("\n") + 1 for _, v in rows]
+    total_lines = sum(line_counts) + 1
+    fig, ax = plt.subplots(figsize=(11, 0.28 * total_lines + 1.5))
+    ax.axis("off")
+    tbl = ax.table(
+        cellText=[[m, v] for m, v in rows],
+        colLabels=["Metric", "Value"],
+        colWidths=[0.3, 0.7],
+        loc="upper left",
+        cellLoc="left",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    unit = 1.0 / total_lines
+    for (r, c), cell in tbl.get_celld().items():
+        lines = 1 if r == 0 else line_counts[r - 1]
+        cell.set_height(unit * lines)
+        if r == 0:
+            cell.set_facecolor("#2c3e50")
+            cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_facecolor("#f2f2f2" if r % 2 == 0 else "white")
+            if c == 0:
+                cell.set_text_props(fontweight="bold")
+    ax.set_title("Data-quality summary", fontsize=13, fontweight="bold", pad=12)
+    fig.savefig(out_dir / "data_quality_summary.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_dir / 'data_quality_summary.png'}")
+    return table
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="MRI dataset analysis")
+    ap.add_argument("root", type=Path, help="dataset root folder")
+    ap.add_argument("--out", type=Path, default=Path("data_analysis_output"),
+                    help="output folder (default: data_analysis_output)")
+    ap.add_argument("--samples", type=int, default=6, help="images per class in sample grid")
+    ap.add_argument("--seed", type=int, default=42, help="random seed for sampling")
+    ap.add_argument("--show", action="store_true", help="open the sample grid window")
+    args = ap.parse_args()
+
+    if not args.root.is_dir():
+        raise SystemExit(f"Folder not found: {args.root}")
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    print(f"Scanning {args.root} ...")
+    files = discover_images(args.root)
+    if files.empty:
+        raise SystemExit("No images found.")
+    print(f"Found {len(files)} images:")
+    print(files["class"].value_counts().to_string())
+
+    unlabelled = (files["class"] == "Unlabelled").sum()
+    if unlabelled:
+        print(f"WARNING: {unlabelled} images are not inside a Normal/Tumour/Stroke folder.")
+
+    print("\nReading images ...")
+    meta = analyse_dataset(files)
+
+    dimension_and_size_report(meta, args.out)
+    sample_grids(meta, args.out, args.samples, args.seed, args.show)
+    data_quality_table(meta, args.out)
+
+    print(f"\nDone. All outputs are in: {args.out.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
 
 print("\n=== TUMOR AND STROKE SUBTYPES ===")
 print(subtype_df.to_string(index=False))
